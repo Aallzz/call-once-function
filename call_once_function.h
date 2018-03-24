@@ -18,7 +18,7 @@ struct call_once_function<R(As...)> {
     template<typename F>
     constexpr static bool ok_for_fits_small_storage_v = sizeof(F) <= storage_size &&
                                                  alignof(F) <= storage_alignment &&
-                                                 std::is_trivially_move_constructible_v<F>;
+                                                 std::is_nothrow_move_constructible<F>();
 
     template<typename F>
     constexpr static bool not_ok_for_fits_small_storage_v = !ok_for_fits_small_storage_v<F>;
@@ -29,8 +29,8 @@ struct call_once_function<R(As...)> {
     }
 
     template<typename F>
-    static std::enable_if_t<not_ok_for_fits_small_storage_v<F>, F&> as(storage_type& storage) {
-        return *reinterpret_cast<F*&>(storage);
+    static std::enable_if_t<not_ok_for_fits_small_storage_v<F>, F*&> as(storage_type& storage) {
+        return reinterpret_cast<F*&>(storage);
     }
 
     template<typename F>
@@ -41,7 +41,8 @@ struct call_once_function<R(As...)> {
 
     template<typename F>
     static std::enable_if_t<not_ok_for_fits_small_storage_v<F>> move(storage_type& dst, storage_type& src) {
-        reinterpret_cast<F*&>(dst) = reinterpret_cast<F*&>(src);
+        new (&dst) F*(std::move(as<F>(src)));
+        as<F>(src) = nullptr;
     }
 
     template<typename F>
@@ -51,7 +52,7 @@ struct call_once_function<R(As...)> {
 
     template<typename F>
     static std::enable_if_t<not_ok_for_fits_small_storage_v<F>, R> call(storage_type &cur, As&&... args) {
-        return std::move(as<F>(cur))(std::forward<As>(args)...);
+        return std::move(*as<F>(cur))(std::forward<As>(args)...);
     }
 
     template<typename F>
@@ -61,7 +62,7 @@ struct call_once_function<R(As...)> {
 
     template<typename F>
     static std::enable_if_t<not_ok_for_fits_small_storage_v<F>> destroy(storage_type& cur) {
-        delete &as<F>(cur);
+        delete as<F>(cur);
     }
 
 
@@ -106,24 +107,42 @@ struct call_once_function<R(As...)> {
        other.fs = make_empty_function_ops();
     }
 
-    template<typename F>
+    template<typename F, std::enable_if_t<ok_for_fits_small_storage_v<F>>* = nullptr>
     call_once_function(F f) : fs(make_function_ops<F>()) {
-        if (ok_for_fits_small_storage_v<F>)
-            new (&storage) F(std::move(f));
-        else
-            new (&storage) F*(new F(std::move(f)));
-//        move<F>(storage, f.storage);
+        new (&storage) F(std::move(f));
     }
 
-    void swap(call_once_function &rhs) {
-            std::swap(storage, rhs.storage);
-            std::swap(fs, rhs.fs);
-        }
+    template<typename F, std::enable_if_t<not_ok_for_fits_small_storage_v<F>>* = nullptr>
+    call_once_function(F f) : fs(make_function_ops<F>()) {
+        new (&storage) F*(new F(std::move(f)));
+    }
+
+    void swap(call_once_function &other) noexcept {
+        storage_type temp1, temp2;
+        fs->move(temp1, storage);
+        fs->destroy(storage);
+        other.fs->move(temp2, other.storage);
+        other.fs->destroy(other.storage);
+        fs->move(other.storage, temp1);
+        fs->destroy(temp1);
+        other.fs->move(storage, temp2);
+        other.fs->destroy(temp2);
+        std::swap(fs, other.fs);
+    }
+
+    call_once_function& operator=(call_once_function&& other) noexcept {
+        swap(other);
+        return *this;
+    }
+
 
     R operator () (As&&... args) {
         return fs->call(storage, std::forward<As>(args)...);
     }
 
+    ~call_once_function() {
+        fs->destroy(storage);
+    }
 };
 
 #endif // CALL_ONCE_FUNCTION_H
